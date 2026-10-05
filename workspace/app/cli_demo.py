@@ -175,6 +175,51 @@ def main():
         print(f"  {'✓' if c['passed'] else '✗'} {c['check']} {c.get('detail','')}")
     print(f"\n  总结论：verified = {v['verified']}")
 
+    line("13. 断网投票草稿：离线存「动作+快照指纹」，恢复后先核对再一次性提交（幂等）")
+    c2 = svc.create_cohort("sponsor", tid, 2, 20.0, "mg", 3, 21,
+                           rationale="断网草稿演示队列")["cohort_id"]
+    s2 = [svc.enroll_subject("crc", c2)["subject_id"] for _ in range(3)]
+    svc.freeze_cohort("pi", c2)
+    for x in s2:
+        svc.record_administration("nurse", c2, x, given_at="2026-10-23T10:00:00+00:00")
+    svc.advance_clock("2026-11-14T10:01:00+00:00")
+    sp2 = svc.create_snapshot("system", c2)
+    print(f"  快照 {sp2['snapshot_id']} 五门全过（规则 v{sp2['ruleset_version']}），"
+          "委员此时断网，把决定动作+指纹存为本地草稿")
+
+    def draft_of(snap_id, member, action, key):
+        s = svc.get_snapshot(snap_id)
+        return dict(draft_key=key, snapshot_id=snap_id, member_id=member, action=action,
+                    content_hash=s["content_hash"], ruleset_version=s["ruleset_version"],
+                    signature=sign(svc.conn, member, snap_id, s["content_hash"], action),
+                    expected_version=s["vote_version"])
+
+    d1 = draft_of(sp2["snapshot_id"], "CM-DAC", "escalate", "demo-draft-1")
+    print("  断网期间：规则集换版 v3（草稿锚定 v2）")
+    svc.publish_ruleset("dmc", {
+        "min_severity_dlt": "grade4",
+        "bands": [{"max_dlt": 0, "action": "escalate"},
+                  {"max_dlt": None, "action": "stop"}]}, "修订 v3")
+    expect_conflict("恢复后提交断网草稿（规则已换版）",
+                    lambda: svc.submit_vote_draft("cm", **d1))
+    q = svc.list_vote_drafts(c2)
+    print(f"  队列 API 冲突原因：[{q[0]['conflict_code']}] {q[0]['conflict_reason']}")
+    print(f"  写入已被阻止：该快照票数 = {svc.get_snapshot(sp2['snapshot_id'])['vote_version']}")
+
+    sp3 = svc.create_snapshot("system", c2)
+    d2 = draft_of(sp3["snapshot_id"], "CM-DAC", "escalate", "demo-draft-2")
+    r1 = svc.submit_vote_draft("cm", **d2)
+    r2 = svc.submit_vote_draft("cm", **d2)  # 重复点击提交
+    print(f"  新快照 {sp3['snapshot_id']}（v3 规则）草稿提交成功：vote={r1['vote_id']}")
+    print(f"  同一草稿重复提交：duplicate={r2['duplicate']}，vote_id 相同={r1['vote_id']==r2['vote_id']}"
+          f"，总票数={svc.get_snapshot(sp3['snapshot_id'])['vote_version']}（无第二张票）")
+    svc.cast_vote("CM-ELN", sp3["snapshot_id"], "CM-ELN", "escalate",
+                  sign(svc.conn, "CM-ELN", sp3["snapshot_id"],
+                       sp3["content_hash"], "escalate"), 1)
+    d3 = svc.issue_decision("dsmb", sp3["snapshot_id"])
+    ok = svc.verify_proof(d3["decision_id"])["verified"]
+    print(f"  实时投票与签发不受影响：决定 {d3['decision_id']} → {d3['action']}，证明 verified={ok}")
+
 
 if __name__ == "__main__":
     main()

@@ -172,6 +172,24 @@ CREATE TABLE IF NOT EXISTS decisions (
   created_by  TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS vote_drafts (
+  id           TEXT PRIMARY KEY,
+  draft_key    TEXT NOT NULL UNIQUE,   -- 客户端幂等键：重复提交只返回首次结果
+  snapshot_id  TEXT NOT NULL,
+  cohort_id    TEXT NOT NULL,
+  member_id    TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  content_hash TEXT NOT NULL,          -- 草稿锚定的快照指纹
+  ruleset_version INTEGER NOT NULL,    -- 草稿锚定的规则版本
+  status       TEXT NOT NULL,          -- submitted|expired（待提交仅存在于委员本机）
+  conflict_code TEXT,                  -- 过期/冲突的机器可读原因（队列 API 返回）
+  conflict_reason TEXT,                -- 人类可读冲突原因
+  vote_id      TEXT,                   -- 提交成功落库的投票
+  result_version INTEGER,              -- 首次提交返回的投票版本（幂等回放用）
+  created_at   TEXT NOT NULL,
+  submitted_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS holds (
   id         TEXT PRIMARY KEY,
   scope      TEXT NOT NULL,            -- trial|cohort
@@ -192,6 +210,7 @@ CREATE INDEX IF NOT EXISTS idx_ae_cohort ON adverse_events(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_pending_cohort ON pending_data(cohort_id, status);
 CREATE INDEX IF NOT EXISTS idx_votes_snapshot ON votes(snapshot_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_cohort ON decisions(cohort_id);
+CREATE INDEX IF NOT EXISTS idx_drafts_cohort ON vote_drafts(cohort_id);
 """
 
 # 使旧快照失效的“实质性事件”：迟到 AE / AE 评估变更 / 替补 / 给药事实。

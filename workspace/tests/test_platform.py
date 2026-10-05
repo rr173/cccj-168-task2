@@ -195,8 +195,9 @@ class PlatformTest(unittest.TestCase):
         t1.start(); t2.start(); t1.join(); t2.join()
         # 恰好一个成功，另一个收到版本冲突——不存在基于陈旧视图的合并
         self.assertEqual(sorted(results.values()), ["ok", "snapshot_version_conflict"])
-        # 失败者用新版本重试后成功
-        self.vote(sid, "CM-ELN", "escalate", 1, ch=ch)
+        # 失败者用新版本重试后成功（谁赢得竞争不定，按实际结果取失败者）
+        loser = next(m for m, r in results.items() if r != "ok")
+        self.vote(sid, loser, "escalate", 1, ch=ch)
         d = self.svc.issue_decision("test", sid)
         self.assertEqual(d["action"], "escalate")
         self.assertTrue(self.svc.verify_proof(d["decision_id"])["verified"])
@@ -461,6 +462,160 @@ class PlatformTest(unittest.TestCase):
         d = self.two_votes_and_decide(sid, "expand")
         self.assertEqual(d["action"], "expand")
         self.assertTrue(self.svc.get_cohort(d["child_cohort_id"]))
+    # ---------------------------------------------------------- 13 断网投票草稿
+    def ready_snapshot(self):
+        cid = self.cid()
+        sids = self.enroll_freeze_dose(cid)
+        self.close_windows()
+        snap = self.svc.create_snapshot("test", cid)
+        assert snap["gates"]["ready"]
+        return cid, snap["snapshot_id"], sids
+
+    def make_draft(self, sid, member, action, key):
+        """模拟委员断网时在本地保存的草稿：动作 + 快照指纹 + 规则版本。"""
+        snap = self.svc.get_snapshot(sid)
+        return {
+            "draft_key": key, "snapshot_id": sid, "member_id": member,
+            "action": action, "content_hash": snap["content_hash"],
+            "ruleset_version": snap["ruleset_version"],
+            "signature": self.sign(member, sid, action, snap["content_hash"]),
+            "expected_version": snap["vote_version"],
+        }
+
+    def submit_draft(self, d):
+        return self.svc.submit_vote_draft(
+            "test", d["draft_key"], d["snapshot_id"], d["member_id"], d["action"],
+            d["content_hash"], d["ruleset_version"], d["signature"],
+            d["expected_version"])
+
+    def test_offline_draft_submit_after_reconnect(self):
+        cid, sid, _ = self.ready_snapshot()
+        r = self.submit_draft(self.make_draft(sid, "CM-DAC", "escalate", "dk-1"))
+        self.assertEqual(r["status"], "submitted")
+        self.assertFalse(r["duplicate"])
+        self.assertEqual(r["version"], 1)
+        # 队列 API：已提交，可溯源到投票
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["status"], "submitted")
+        self.assertEqual(q[0]["vote_id"], r["vote_id"])
+        # 实时投票与决策证明继续可用
+        self.vote(sid, "CM-ELN", "escalate", 1)
+        d = self.svc.issue_decision("test", sid)
+        self.assertTrue(self.svc.verify_proof(d["decision_id"])["verified"])
+
+    def test_draft_idempotent_replay_no_second_vote(self):
+        cid, sid, _ = self.ready_snapshot()
+        r1 = self.submit_draft(self.make_draft(sid, "CM-DAC", "escalate", "dk-1"))
+        # 同一草稿重复点击提交（哪怕客户端重新取态签名）：只得到首次结果
+        again = self.make_draft(sid, "CM-DAC", "escalate", "dk-1")
+        r2 = self.submit_draft(again)
+        self.assertTrue(r2["duplicate"])
+        self.assertEqual(r2["vote_id"], r1["vote_id"])
+        self.assertEqual(r2["version"], r1["version"])
+        n = self.conn.execute(
+            "SELECT COUNT(*) c FROM votes WHERE snapshot_id=?", (sid,)).fetchone()["c"]
+        self.assertEqual(n, 1)  # 不产生第二张票
+
+    def test_draft_expired_by_late_ae_and_replay_same_result(self):
+        cid, sid, sids = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-late")
+        # 断网期间：迟到 AE 到达，快照被推进
+        self.svc.report_ae("test", cid, sids[1], "迟报血小板下降", "grade3",
+                           "2026-10-20T00:00:00+00:00")
+        with self.assertRaises(Conflict) as cm:
+            self.submit_draft(draft)
+        self.assertEqual(cm.exception.code, "draft_expired")
+        self.assertIn("迟到", cm.exception.message)
+        # 写入被阻止：没有任何投票落库
+        self.assertEqual(self.svc.get_snapshot(sid)["vote_version"], 0)
+        # 队列 API 返回冲突原因
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["status"], "expired")
+        self.assertEqual(q[0]["conflict_code"], "snapshot_superseded")
+        self.assertIn("迟到", q[0]["conflict_reason"])
+        # 重复提交同一过期草稿：得到首次的同一拒绝结果，仍无票、仍只有一条队列记录
+        with self.assertRaises(Conflict) as cm2:
+            self.submit_draft(draft)
+        self.assertEqual(cm2.exception.code, "draft_expired")
+        self.assertEqual(self.svc.get_snapshot(sid)["vote_version"], 0)
+        self.assertEqual(len(self.svc.list_vote_drafts(cid)), 1)
+
+    def test_draft_expired_by_subject_replacement(self):
+        cid, sid, sids = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-rep")
+        self.svc.replace_subject("test", cid, sids[2], "撤回知情同意")
+        with self.assertRaises(Conflict) as cm:
+            self.submit_draft(draft)
+        self.assertEqual(cm.exception.code, "draft_expired")
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(q[0]["conflict_code"], "snapshot_superseded")
+        self.assertIn("替补", q[0]["conflict_reason"])
+
+    def test_draft_expired_by_ruleset_change_but_realtime_vote_unaffected(self):
+        cid, sid, _ = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-rule")
+        self.svc.publish_ruleset("test", {
+            "min_severity_dlt": "grade4",
+            "bands": [{"max_dlt": 0, "action": "escalate"},
+                      {"max_dlt": None, "action": "stop"}]}, "v2：门槛上调")
+        with self.assertRaises(Conflict) as cm:
+            self.submit_draft(draft)
+        self.assertEqual(cm.exception.code, "draft_expired")
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(q[0]["conflict_code"], "ruleset_changed")
+        self.assertIn("v2", q[0]["conflict_reason"])
+        # 原有实时投票通道不受规则换版影响（快照仍绑定 v1，可实时投票）
+        self.vote(sid, "CM-ELN", "escalate", 0)
+        self.assertEqual(self.svc.get_snapshot(sid)["vote_version"], 1)
+
+    def test_draft_fingerprint_mismatch_rejected(self):
+        cid, sid, _ = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-bad")
+        draft["content_hash"] = "0" * 64
+        draft["signature"] = self.sign("CM-DAC", sid, "escalate", "0" * 64)
+        with self.assertRaises(Conflict) as cm:
+            self.submit_draft(draft)
+        self.assertEqual(cm.exception.code, "draft_expired")
+        self.assertEqual(self.svc.list_vote_drafts(cid)[0]["conflict_code"],
+                         "content_hash_mismatch")
+
+    def test_draft_version_conflict_is_transient_not_expired(self):
+        cid, sid, _ = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-vc")  # expected_version=0
+        # 另一委员先实时投票，版本推进
+        self.vote(sid, "CM-ELN", "escalate", 0)
+        with self.assertRaises(Conflict) as cm:
+            self.submit_draft(draft)
+        self.assertEqual(cm.exception.code, "snapshot_version_conflict")
+        # 瞬时冲突不判过期：队列无记录，刷新版本号后同一 draft_key 可成功提交
+        self.assertEqual(self.svc.list_vote_drafts(cid), [])
+        draft["expected_version"] = 1
+        r = self.submit_draft(draft)
+        self.assertEqual(r["status"], "submitted")
+        self.assertEqual(r["version"], 2)
+
+    def test_draft_concurrent_double_submit_single_vote(self):
+        cid, sid, _ = self.ready_snapshot()
+        draft = self.make_draft(sid, "CM-DAC", "escalate", "dk-cc")
+        results = []
+
+        def go():
+            try:
+                results.append(self.submit_draft(draft))
+            except Conflict as e:
+                results.append({"error": e.code})
+
+        t1 = threading.Thread(target=go)
+        t2 = threading.Thread(target=go)
+        t1.start(); t2.start(); t1.join(); t2.join()
+        # 恰好一张票；两个线程拿到同一个 vote_id（一个首交、一个幂等回放）
+        n = self.conn.execute(
+            "SELECT COUNT(*) c FROM votes WHERE snapshot_id=?", (sid,)).fetchone()["c"]
+        self.assertEqual(n, 1)
+        self.assertEqual(len({r.get("vote_id") for r in results}), 1)
+        self.assertEqual(sorted(r["duplicate"] for r in results), [False, True])
 
 
 if __name__ == "__main__":

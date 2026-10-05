@@ -9,6 +9,7 @@ import json
 import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from .crypto import canonical_json, hmac_hex
 from .errors import DomainError
@@ -74,6 +75,10 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
                         self._send(svc.get_decision(did))
                 elif path == "/api/journal":
                     self._send({"events": svc.list_journal()})
+                elif path == "/api/drafts":
+                    qs = parse_qs(urlparse(self.path).query)
+                    self._send({"drafts": svc.list_vote_drafts(
+                        qs.get("cohort_id", [None])[0])})
                 elif path in ("/", "/index.html"):
                     self._file("index.html")
                 elif path.startswith("/"):
@@ -153,6 +158,12 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
             elif path.startswith("/api/snapshots/") and path.endswith("/votes"):
                 self._send(s.cast_vote(
                     actor, path.split("/")[3], d["member_id"], d["action"],
+                    d["signature"], int(d["expected_version"])), 201)
+            elif path == "/api/drafts":
+                # 断网草稿一次性提交（draft_key 幂等；过期返回 409 + 冲突原因）
+                self._send(s.submit_vote_draft(
+                    actor, d["draft_key"], d["snapshot_id"], d["member_id"],
+                    d["action"], d["content_hash"], int(d["ruleset_version"]),
                     d["signature"], int(d["expected_version"])), 201)
             elif path.startswith("/api/snapshots/") and path.endswith("/decisions"):
                 self._send(s.issue_decision(actor, path.split("/")[3]), 201)
