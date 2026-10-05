@@ -159,6 +159,22 @@ CREATE TABLE IF NOT EXISTS votes (
   UNIQUE(snapshot_id, member_id)       -- 同一快照每人一票
 );
 
+CREATE TABLE IF NOT EXISTS vote_drafts (
+  id           TEXT PRIMARY KEY,      -- 客户端生成的草稿 ID（幂等键）
+  snapshot_id  TEXT NOT NULL,
+  cohort_id    TEXT NOT NULL,
+  member_id    TEXT NOT NULL,
+  action       TEXT NOT NULL,
+  content_hash TEXT NOT NULL,          -- 草稿锚定的快照指纹
+  signature    TEXT NOT NULL,          -- 委员离线时对「动作+指纹」的 HMAC 签名
+  status       TEXT NOT NULL,          -- submitted|expired（待提交只存在于客户端本地）
+  vote_id      TEXT,                   -- submitted 时产生的票
+  conflict_code TEXT,                  -- expired 的冲突原因码（队列 API 返回）
+  conflict_detail TEXT,
+  created_at   TEXT NOT NULL,          -- 服务端首次收到时间
+  resolved_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
   id          TEXT PRIMARY KEY,
   cohort_id   TEXT NOT NULL,
@@ -191,6 +207,7 @@ CREATE INDEX IF NOT EXISTS idx_subjects_cohort ON subjects(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_ae_cohort ON adverse_events(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_pending_cohort ON pending_data(cohort_id, status);
 CREATE INDEX IF NOT EXISTS idx_votes_snapshot ON votes(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_drafts_cohort ON vote_drafts(cohort_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_cohort ON decisions(cohort_id);
 """
 

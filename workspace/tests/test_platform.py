@@ -19,7 +19,7 @@ DOSE = "2026-10-01T10:00:00+00:00"
 AFTER_WINDOW = "2026-10-22T10:01:00+00:00"
 
 
-class PlatformTest(unittest.TestCase):
+class PlatformBase(unittest.TestCase):
     def setUp(self):
         self.conn = connect(":memory:")
         self.svc = Services(self.conn)
@@ -60,6 +60,8 @@ class PlatformTest(unittest.TestCase):
         self.vote(sid, "CM-ELN", action, 1)
         return self.svc.issue_decision("test", sid)
 
+
+class PlatformTest(PlatformBase):
     # ---------------------------------------------------------- 1 冻结
     def test_freeze_locks_dose_and_set(self):
         cid = self.cid()
@@ -461,6 +463,150 @@ class PlatformTest(unittest.TestCase):
         d = self.two_votes_and_decide(sid, "expand")
         self.assertEqual(d["action"], "expand")
         self.assertTrue(self.svc.get_cohort(d["child_cohort_id"]))
+
+
+class OfflineDraftTest(PlatformBase):
+    """断网投票草稿：本地草稿 → 恢复后先核对快照 → 幂等一次性提交。"""
+
+    def ready_snapshot(self):
+        cid = self.cid()
+        self.enroll_freeze_dose(cid)
+        self.close_windows()
+        snap = self.svc.create_snapshot("test", cid)
+        assert snap["gates"]["ready"]
+        return cid, snap["snapshot_id"]
+
+    def draft(self, sid, member, action="escalate", version=0,
+              draft_id="DR-1", ch=None):
+        ch = ch or self.svc.get_snapshot(sid)["content_hash"]
+        return {"draft_id": draft_id, "snapshot_id": sid, "member_id": member,
+                "action": action, "content_hash": ch,
+                "signature": self.sign(member, sid, action, ch),
+                "expected_version": version}
+
+    def submit(self, d):
+        return self.svc.submit_vote_draft("test", **d)
+
+    def vote_count(self, sid):
+        return self.conn.execute(
+            "SELECT COUNT(*) c FROM votes WHERE snapshot_id=?", (sid,)
+        ).fetchone()["c"]
+
+    # 提交成功 + 幂等回放：重复提交只得到首次结果，不产生第二张票
+    def test_draft_submit_and_idempotent_replay(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC")
+        r1 = self.submit(d)
+        self.assertEqual(r1["status"], "submitted")
+        self.assertEqual(self.vote_count(sid), 1)
+        r2 = self.submit(d)
+        self.assertTrue(r2["replayed"])
+        self.assertEqual(r2["vote_id"], r1["vote_id"])
+        self.assertEqual(self.vote_count(sid), 1)
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["status"], "submitted")
+
+    # 同一幂等键携带不同载荷 → 拒绝
+    def test_draft_payload_mismatch_rejected(self):
+        cid, sid = self.ready_snapshot()
+        self.submit(self.draft(sid, "CM-DAC"))
+        d2 = self.draft(sid, "CM-DAC", action="stop")  # 同一 draft_id=DR-1
+        with self.assertRaises(Conflict) as cm:
+            self.submit(d2)
+        self.assertEqual(cm.exception.code, "draft_payload_mismatch")
+        self.assertEqual(self.vote_count(sid), 1)
+
+    # 迟到事件推进快照 → 草稿过期并阻止写入；队列 API 返回冲突原因
+    def test_draft_expired_by_late_ae(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC")
+        sids = [s["id"] for s in self.svc.get_cohort(cid)["subjects"]]
+        self.svc.report_ae("test", cid, sids[0], "迟报 DLT", "grade3",
+                           "2026-10-20T00:00:00+00:00")
+        r = self.submit(d)
+        self.assertEqual(r["status"], "expired")
+        self.assertEqual(r["conflict"]["code"], "snapshot_superseded")
+        self.assertEqual(self.vote_count(sid), 0)  # 阻止写入
+        q = self.svc.list_vote_drafts(cid)
+        self.assertEqual(q[0]["status"], "expired")
+        self.assertEqual(q[0]["conflict"]["code"], "snapshot_superseded")
+        # 重复提交仍是首次结果，仍无票
+        r2 = self.submit(d)
+        self.assertEqual(r2["status"], "expired")
+        self.assertEqual(self.vote_count(sid), 0)
+
+    # 替补推进快照 → 草稿过期
+    def test_draft_expired_by_replacement(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC")
+        sid0 = self.svc.get_cohort(cid)["subjects"][0]["id"]
+        self.svc.replace_subject("test", cid, sid0, "撤回知情同意")
+        r = self.submit(d)
+        self.assertEqual(r["status"], "expired")
+        self.assertEqual(r["conflict"]["code"], "snapshot_superseded")
+        self.assertEqual(self.vote_count(sid), 0)
+
+    # 规则换版 → 草稿过期；但实时投票在旧快照上仍可用（既有语义不变）
+    def test_draft_expired_by_ruleset_change_realtime_still_works(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC")
+        self.svc.publish_ruleset("test", {
+            "min_severity_dlt": "grade4",
+            "bands": [{"max_dlt": 0, "action": "escalate"},
+                      {"max_dlt": None, "action": "stop"}]}, "v2")
+        r = self.submit(d)
+        self.assertEqual(r["status"], "expired")
+        self.assertEqual(r["conflict"]["code"], "ruleset_advanced")
+        self.assertEqual(self.vote_count(sid), 0)
+        # 原有实时投票继续可用（在线委员看得见规则换版，自行判断）
+        self.vote(sid, "CM-ELN", "escalate", 0)
+        self.assertEqual(self.vote_count(sid), 1)
+
+    # 委员已实时投票 → 草稿过期 vote_exists，不产生第二张票
+    def test_draft_expired_when_member_already_voted(self):
+        cid, sid = self.ready_snapshot()
+        self.vote(sid, "CM-DAC", "escalate", 0)
+        r = self.submit(self.draft(sid, "CM-DAC", version=1))
+        self.assertEqual(r["status"], "expired")
+        self.assertEqual(r["conflict"]["code"], "vote_exists")
+        self.assertEqual(self.vote_count(sid), 1)
+
+    # 伪造签名 → 拒绝且不入队
+    def test_draft_bad_signature_not_queued(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC")
+        d["signature"] = "deadbeef"
+        with self.assertRaises(Conflict) as cm:
+            self.submit(d)
+        self.assertEqual(cm.exception.code, "bad_signature")
+        self.assertEqual(self.svc.list_vote_drafts(cid), [])
+
+    # 瞬态版本冲突：不落库，刷新版本后同一草稿提交成功
+    def test_draft_version_conflict_is_transient(self):
+        cid, sid = self.ready_snapshot()
+        d = self.draft(sid, "CM-DAC", version=0)
+        self.vote(sid, "CM-ELN", "escalate", 0)  # 版本推到 1
+        with self.assertRaises(Conflict) as cm:
+            self.submit(d)
+        self.assertEqual(cm.exception.code, "snapshot_version_conflict")
+        self.assertEqual(self.svc.list_vote_drafts(cid), [])  # 未落库
+        d["expected_version"] = 1
+        r = self.submit(d)
+        self.assertEqual(r["status"], "submitted")
+        self.assertEqual(self.vote_count(sid), 2)
+
+    # 两张草稿提交 → 签发决定 → 证明校验通过（实时链路不受影响）
+    def test_drafts_then_decision_and_proof(self):
+        cid, sid = self.ready_snapshot()
+        r1 = self.submit(self.draft(sid, "CM-DAC", draft_id="DR-A", version=0))
+        r2 = self.submit(self.draft(sid, "CM-ELN", draft_id="DR-B", version=1))
+        self.assertEqual(r1["status"], "submitted")
+        self.assertEqual(r2["status"], "submitted")
+        d = self.svc.issue_decision("test", sid)
+        self.assertEqual(d["action"], "escalate")
+        v = self.svc.verify_proof(d["decision_id"])
+        self.assertTrue(v["verified"], msg=json.dumps(v["checks"], ensure_ascii=False))
 
 
 if __name__ == "__main__":

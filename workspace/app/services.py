@@ -802,6 +802,152 @@ class Services:
         payload = self._load_snapshot_payload(snap)
         return canonical_hash(payload)
 
+    # ------------------------------------------------------------- 断网投票草稿
+    # 草稿在委员本地（离线）生成并签名，网络恢复后由本端点一次性提交：
+    # 先核对快照仍然有效（未被迟到事件/替补推进、规则未换版、指纹一致），
+    # 再原子写票；同一 draft_id 重复提交返回首次结果，绝不产生第二张票。
+    # 待提交（pending）状态只存在于客户端本地；服务端队列只记录终态。
+    TRANSIENT_DRAFT_CONFLICTS = {"snapshot_version_conflict", "hold_active"}
+
+    def submit_vote_draft(self, actor: str, draft_id: str, snapshot_id: str,
+                          member_id: str, action: str, content_hash: str,
+                          signature: str, expected_version: int) -> dict:
+        if not draft_id:
+            raise ValidationFailed("draft_id 必填（客户端生成的幂等键）")
+        with self._lock:
+            # 1) 幂等回放：同一 draft_id 直接返回首次结果，不产生第二张票
+            row = self.conn.execute(
+                "SELECT * FROM vote_drafts WHERE id=?", (draft_id,)).fetchone()
+            if row is not None:
+                core = (row["snapshot_id"], row["member_id"], row["action"],
+                        row["content_hash"])
+                if core != (snapshot_id, member_id, action, content_hash):
+                    raise Conflict("draft_payload_mismatch",
+                                   "同一 draft_id 携带了不同的投票载荷，拒绝重放")
+                view = self._draft_view(row)
+                view["replayed"] = True
+                return view
+
+            # 2) 认证：委员在职、动作合法、离线签名有效（动作+快照指纹）
+            member = self.conn.execute(
+                "SELECT * FROM committee_members WHERE member_id=? AND active=1",
+                (member_id,)).fetchone()
+            if member is None:
+                raise NotFound(f"在职委员 {member_id}")
+            if action not in rules.VALID_ACTIONS:
+                raise ValidationFailed(f"action 必须是 {sorted(rules.VALID_ACTIONS)}")
+            message = canonical_json({
+                "snapshot_id": snapshot_id, "content_hash": content_hash,
+                "action": action, "member_id": member_id})
+            if not verify_hmac(member["hmac_key"], message, signature):
+                raise Conflict("bad_signature", "草稿签名校验失败")
+
+            # 3) 核对快照仍然有效（草稿专用：含规则换版检查）
+            snap = self.conn.execute(
+                "SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
+            conflict = self._draft_snapshot_conflict(snap)
+            if conflict is None and snap["content_hash"] != content_hash:
+                conflict = ("snapshot_hash_mismatch",
+                            "草稿锚定的快照指纹与快照内容哈希不一致")
+            if conflict is not None:
+                return self._expire_draft(actor, draft_id, snap, snapshot_id,
+                                          member_id, action, content_hash,
+                                          signature, *conflict)
+
+            # 4) 快照有效：复用实时投票的全部检查，原子写票
+            try:
+                vote = self.cast_vote(actor, snapshot_id, member_id, action,
+                                      signature, expected_version)
+            except Conflict as e:
+                if e.code in self.TRANSIENT_DRAFT_CONFLICTS:
+                    raise  # 瞬态冲突：不落库，客户端刷新后持同一 draft_id 重试
+                return self._expire_draft(actor, draft_id, snap, snapshot_id,
+                                          member_id, action, content_hash,
+                                          signature, e.code, e.message)
+            ts = now_iso(self.conn)
+            with self.conn:
+                append_event(self.conn, "vote_draft_submitted", actor, {
+                    "draft_id": draft_id, "snapshot_id": snapshot_id,
+                    "cohort_id": snap["cohort_id"], "member_id": member_id,
+                    "action": action, "vote_id": vote["vote_id"],
+                    "content_hash": content_hash}, snap["cohort_id"])
+                self.conn.execute(
+                    "INSERT INTO vote_drafts(id,snapshot_id,cohort_id,member_id,action,"
+                    "content_hash,signature,status,vote_id,created_at,resolved_at)"
+                    " VALUES(?,?,?,?,?,?,?, 'submitted',?,?,?)",
+                    (draft_id, snapshot_id, snap["cohort_id"], member_id, action,
+                     content_hash, signature, vote["vote_id"], ts, ts))
+            return self.get_vote_draft(draft_id)
+
+    def _expire_draft(self, actor: str, draft_id: str, snap, snapshot_id: str,
+                      member_id: str, action: str, content_hash: str,
+                      signature: str, code: str, message: str) -> dict:
+        """永久性冲突：草稿落库为 expired（含冲突原因），不写入任何票。"""
+        cohort_id = snap["cohort_id"] if snap else None
+        ts = now_iso(self.conn)
+        with self.conn:
+            append_event(self.conn, "vote_draft_expired", actor, {
+                "draft_id": draft_id, "snapshot_id": snapshot_id,
+                "cohort_id": cohort_id, "member_id": member_id, "action": action,
+                "conflict_code": code, "detail": message}, cohort_id)
+            self.conn.execute(
+                "INSERT INTO vote_drafts(id,snapshot_id,cohort_id,member_id,action,"
+                "content_hash,signature,status,conflict_code,conflict_detail,"
+                "created_at,resolved_at) VALUES(?,?,?,?,?,?,?, 'expired',?,?,?,?)",
+                (draft_id, snapshot_id, cohort_id or "", member_id, action,
+                 content_hash, signature, code, message, ts, ts))
+        return self.get_vote_draft(draft_id)
+
+    def _draft_snapshot_conflict(self, snap) -> tuple[str, str] | None:
+        """草稿提交前的快照有效性核对。
+
+        与实时投票相同的失效检查（迟到事件/替补/新实质事件），外加草稿特有规则：
+        规则换版后，离线期间按旧规则结论作出的决定必须基于新快照重新作出。
+        """
+        if snap is None:
+            return ("snapshot_not_found", "草稿锚定的快照不存在")
+        if snap["superseded"]:
+            return ("snapshot_superseded",
+                    "快照已被迟到事件/替补等实质性事件失效，须重建快照后重新决定")
+        if self._latest_material_seq(snap["cohort_id"]) > snap["material_seq"]:
+            return ("snapshot_superseded", "快照之后出现新的实质性事件，须重建快照")
+        active = self._active_ruleset_version()
+        if snap["ruleset_version"] != active:
+            return ("ruleset_advanced",
+                    f"规则已换版（快照绑定 v{snap['ruleset_version']}，当前生效 "
+                    f"v{active}），离线决定不再有效，须基于新规则重建快照")
+        return None
+
+    def _draft_view(self, row) -> dict:
+        return {
+            "draft_id": row["id"], "snapshot_id": row["snapshot_id"],
+            "cohort_id": row["cohort_id"], "member_id": row["member_id"],
+            "action": row["action"], "content_hash": row["content_hash"],
+            "signature": row["signature"],
+            "status": row["status"], "vote_id": row["vote_id"],
+            "conflict": ({"code": row["conflict_code"],
+                          "message": row["conflict_detail"]}
+                         if row["conflict_code"] else None),
+            "created_at": row["created_at"], "resolved_at": row["resolved_at"],
+        }
+
+    def get_vote_draft(self, draft_id: str) -> dict:
+        row = self.conn.execute(
+            "SELECT * FROM vote_drafts WHERE id=?", (draft_id,)).fetchone()
+        if row is None:
+            raise NotFound(f"草稿 {draft_id}")
+        return self._draft_view(row)
+
+    def list_vote_drafts(self, cohort_id: str | None = None) -> list:
+        if cohort_id:
+            rows = self.conn.execute(
+                "SELECT * FROM vote_drafts WHERE cohort_id=? ORDER BY created_at,id",
+                (cohort_id,)).fetchall()
+        else:
+            rows = self.conn.execute(
+                "SELECT * FROM vote_drafts ORDER BY created_at,id").fetchall()
+        return [self._draft_view(r) for r in rows]
+
     # ------------------------------------------------------------- 决策证明
     def issue_decision(self, actor: str, snapshot_id: str) -> dict:
         snap = self.conn.execute("SELECT * FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
@@ -1095,6 +1241,7 @@ class Services:
         decisions = [dict(r) for r in self.conn.execute(
             "SELECT id,cohort_id,snapshot_id,action,outcome,child_cohort_id,"
             "proof_hash,created_at FROM decisions ORDER BY created_at")]
+        drafts = self.list_vote_drafts()
         chain = verify_chain(self.conn)
         return {
             "now": now_iso(self.conn),
@@ -1105,6 +1252,7 @@ class Services:
             "holds": holds,
             "snapshots": snapshots,
             "decisions": decisions,
+            "drafts": drafts,
             "journal": {"events": chain["events"], "head": chain["head"][:16],
                         "chain_ok": chain["ok"]},
         }

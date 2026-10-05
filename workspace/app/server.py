@@ -60,9 +60,14 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
             try:
                 if path == "/api/state":
                     self._send(svc.get_state())
+                elif path == "/api/drafts":
+                    self._send({"drafts": svc.list_vote_drafts()})
                 elif path.startswith("/api/cohorts/"):
-                    cid = path.split("/")[3]
-                    self._send(svc.get_cohort(cid))
+                    parts = path.split("/")
+                    if len(parts) == 5 and parts[4] == "drafts":
+                        self._send({"drafts": svc.list_vote_drafts(parts[3])})
+                    else:
+                        self._send(svc.get_cohort(parts[3]))
                 elif path.startswith("/api/snapshots/"):
                     self._send(svc.get_snapshot(path.split("/")[3]))
                 elif path.startswith("/api/decisions/"):
@@ -154,6 +159,22 @@ def build_server(db_path: str, host: str = "127.0.0.1", port: int = 8080):
                 self._send(s.cast_vote(
                     actor, path.split("/")[3], d["member_id"], d["action"],
                     d["signature"], int(d["expected_version"])), 201)
+            elif path == "/api/drafts":
+                # 断网草稿一次性提交（幂等）：过期返回 409 + 冲突原因与草稿记录
+                view = s.submit_vote_draft(
+                    actor, d["draft_id"], d["snapshot_id"], d["member_id"],
+                    d["action"], d["content_hash"], d["signature"],
+                    int(d.get("expected_version", 0)))
+                if view["status"] == "expired":
+                    c = view["conflict"] or {"code": "draft_expired",
+                                             "message": "草稿已过期"}
+                    self._send({"error": c["code"], "message": c["message"],
+                                "draft": view,
+                                "replayed": bool(view.get("replayed"))}, 409)
+                else:
+                    self._send({"draft": view,
+                                "replayed": bool(view.get("replayed"))},
+                               200 if view.get("replayed") else 201)
             elif path.startswith("/api/snapshots/") and path.endswith("/decisions"):
                 self._send(s.issue_decision(actor, path.split("/")[3]), 201)
             elif path.startswith("/api/decisions/") and path.endswith("/verify"):

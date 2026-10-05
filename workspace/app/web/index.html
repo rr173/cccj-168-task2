@@ -53,6 +53,8 @@
   <input id="customTick" value="2026-10-22T10:01:00+00:00" style="width:230px">
   <button class="ghost" onclick="tick(document.getElementById('customTick').value)">自定义推进</button>
   <span class="tag" id="chainTag">链校验</span>
+  <span class="tag t-ok" id="netTag">🟢 在线</span>
+  <button class="ghost" id="netBtn" onclick="toggleOffline()">模拟断网</button>
   <button class="ghost" onclick="seedDemo()">载入演示数据</button>
   <button class="ghost" onclick="load()">刷新</button>
 </header>
@@ -69,14 +71,33 @@
 <script>
 const API = '';
 let S = null, CID = null, SID = null, DID = null;
+let OFFLINE = false;
 
 async function api(method, path, body){
+  if(OFFLINE) throw Object.assign(new Error('断网模拟中：请求未发送'),{code:'offline'});
   const opt = {method, headers:{'Content-Type':'application/json','X-Actor':'workbench'}};
   if(body) opt.body = JSON.stringify(body);
-  const r = await fetch(API+path, opt);
+  let r;
+  try{ r = await fetch(API+path, opt); }
+  catch(err){
+    setOffline(true);
+    throw Object.assign(new Error('网络不可达：已切换断网状态，投票可存为本地草稿'),{code:'offline'});
+  }
   const j = await r.json().catch(()=>({}));
-  if(!r.ok) throw Object.assign(new Error(j.message||r.statusText),{code:j.error});
+  if(!r.ok) throw Object.assign(new Error(j.message||r.statusText),{code:j.error,body:j});
   return j;
+}
+function setOffline(v){
+  OFFLINE=v;
+  const t=document.getElementById('netTag');
+  t.textContent=v?'🔴 断网（草稿本地保存）':'🟢 在线';
+  t.className='tag '+(v?'t-bad':'t-ok');
+  document.getElementById('netBtn').textContent=v?'恢复网络':'模拟断网';
+}
+function toggleOffline(){
+  setOffline(!OFFLINE);
+  toast(OFFLINE?'已断网：实时操作不可用，可在快照详情「存为断网草稿」':'网络已恢复：请到队列工作台提交「待提交」草稿');
+  if(!OFFLINE) load(); else renderCenter();
 }
 function toast(msg, isErr){
   const box=document.getElementById('toast');
@@ -90,7 +111,11 @@ async function act(label, fn){
 }
 async function seedDemo(){ await act('演示数据', ()=>api('POST','/api/demo/seed',{})); selectCohortAuto(); }
 async function tick(ts){ await act('时钟推进', ()=>api('POST','/api/clock',{now:ts})); }
-async function load(){ S = await api('GET','/api/state'); renderLeft(); renderCenter(); renderRight();
+async function load(){
+  try{ S = await api('GET','/api/state'); }
+  catch(e){ if(e.code!=='offline') toast('状态刷新失败：'+e.message,true); }
+  if(!S) return;
+  renderLeft(); renderCenter(); renderRight();
   document.getElementById('clock').textContent=S.now.replace('T',' ').slice(0,19)+' UTC';
   const tag=document.getElementById('chainTag');
   tag.textContent='哈希链 '+S.journal.events+' 事件';
@@ -101,6 +126,39 @@ function selectCohortAuto(){
 }
 function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
 function statusTag(s){return `<span class="tag t-${s}">${({draft:'草案',active:'进行中',closed:'已关闭',stopped:'已停止'})[s]||s}</span>`}
+
+// ---------------- 断网投票草稿（localStorage 本地队列） ----------------
+const DKEY='voteDrafts.v1';
+function loadDrafts(){ try{ return JSON.parse(localStorage.getItem(DKEY))||[]; }catch(e){ return []; } }
+function saveDrafts(d){ localStorage.setItem(DKEY, JSON.stringify(d)); }
+function uid(){ return 'DR-'+(crypto.randomUUID?crypto.randomUUID().slice(0,8):Date.now().toString(36)); }
+// 与服务端 canonical_json 一致：键排序、无空白、非 ASCII 不转义
+function canonicalJson(o){
+  if(o===null||typeof o!=='object') return JSON.stringify(o);
+  if(Array.isArray(o)) return '['+o.map(canonicalJson).join(',')+']';
+  return '{'+Object.keys(o).sort().map(k=>JSON.stringify(k)+':'+canonicalJson(o[k])).join(',')+'}';
+}
+// 离线 HMAC-SHA256（演示环境委员密钥为 demo-key-{member_id}，与 /api/sign 同源）
+async function hmacHex(key,msg){
+  const enc=new TextEncoder();
+  const ck=await crypto.subtle.importKey('raw',enc.encode(key),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  const sig=await crypto.subtle.sign('HMAC',ck,enc.encode(msg));
+  return [...new Uint8Array(sig)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+// 合并本地待提交草稿与服务端队列（终态以服务端为准）
+function mergedDrafts(){
+  const local=loadDrafts(), server=(S&&S.drafts)||[], byId={};
+  let changed=false;
+  for(const d of local) byId[d.draft_id]=d;
+  for(const sd of server){
+    const cur=byId[sd.draft_id];
+    if(cur){ if(cur.status!==sd.status){ Object.assign(cur,{status:sd.status,vote_id:sd.vote_id,conflict:sd.conflict}); changed=true; } }
+    else byId[sd.draft_id]=Object.assign({member_name:((S.committee.find(m=>m.member_id===sd.member_id)||{}).name)||sd.member_id,remote:true},sd);
+  }
+  if(changed) saveDrafts(local);
+  return Object.values(byId).filter(d=>d.cohort_id===CID)
+    .sort((a,b)=>String(a.created_at).localeCompare(String(b.created_at)));
+}
 
 function renderLeft(){
   let h = `<h2>试验 / 队列</h2>`;
@@ -224,6 +282,31 @@ function renderCenter(){
       <select id="pk"><option>lab</option><option>followup</option><option>ae_assessment</option><option>other</option></select>
       <input id="pn" placeholder="缺失说明" style="flex:1">
       <button onclick="addP()">登记缺失数据</button></div>`;
+
+  // 断网投票草稿队列：待提交（本地）/ 已提交 / 过期（含服务端冲突原因）
+  h+=`<h2 style="margin-top:10px">断网投票草稿</h2>`;
+  const ds=mergedDrafts();
+  if(!ds.length) h+='<div class="mut small">无草稿。断网时在右侧快照详情点「存为断网草稿」，网络恢复后在此核对并提交。</div>';
+  for(const d of ds){
+    const tag=d.status==='submitted'?'<span class="tag t-ok">已提交</span>'
+      :d.status==='expired'?'<span class="tag t-bad">过期</span>'
+      :'<span class="tag t-warn">待提交</span>';
+    h+=`<div class="item"><b>${esc(d.member_name||d.member_id)}</b> → <span class="tag t-info">${d.action}</span> ${tag}
+      <div class="mut small">快照 ${esc(d.snapshot_id)} · 指纹 ${String(d.content_hash).slice(0,12)}… · ${String(d.created_at||'').slice(5,16)}${d.remote?' · 来自服务端队列':''}</div>`;
+    if(d.status==='expired'&&d.conflict)
+      h+=`<div class="small" style="color:var(--bad)">⛔ ${esc(d.conflict.message)} <span class="mono">[${esc(d.conflict.code)}]</span></div>`;
+    if(d.status==='submitted')
+      h+=`<div class="mut small">✓ 已产生 1 张票 ${esc(d.vote_id||'')}（重复提交只返回首次结果，不会产生第二张票）</div>`;
+    h+=`<div class="row">`;
+    if(d.status==='pending')
+      h+=`<button onclick="submitDraft('${d.draft_id}')">核对快照并提交</button>
+          <button class="ghost" onclick="dropDraft('${d.draft_id}')">删除</button>`;
+    else
+      h+=`<button class="ghost" onclick="replayDraft('${d.draft_id}')">查看首次结果（幂等）</button>`;
+    h+=`</div></div>`;
+  }
+  const pendN=ds.filter(d=>d.status==='pending').length;
+  if(pendN>1) h+=`<div class="row"><button onclick="submitAllDrafts()">全部提交（${pendN} 份待提交）</button></div>`;
   el.innerHTML=h;
 }
 
@@ -290,6 +373,7 @@ function renderSnapshotDetail(){
 async function refreshSnapDetail(){
   const box=document.getElementById('snapDetail'); if(!box) return;
   let sp; try{ sp=await getSnap(); }catch(e){ box.innerHTML='<span class="sup">'+esc(e.message)+'</span>'; return; }
+  window.__lastSnap=sp;
   const g=sp.gates, oc=sp.outcome;
   const gateNames={window_complete:'观察窗完整',missing_data_resolved:'缺失数据已处理',
     events_adjudicated:'安全事件全部裁定',evaluable_set_complete:'可评估受试者集合完整',
@@ -316,7 +400,8 @@ async function refreshSnapDetail(){
   h+=`<div class="row"><select id="vm">${S.committee.filter(m=>m.active).map(m=>`<option value="${m.member_id}">${esc(m.name)}（${m.role==='independent'?'独立':'申办方'}）</option>`).join('')}</select>
     <select id="va"><option>escalate</option><option>expand</option><option>stop</option><option>continue</option></select>
     <button ${disabled?'disabled':''} onclick="vote(${sp.vote_version})">签名投票（expected_version=${sp.vote_version}）</button></div>
-    <button class="ok" ${disabled?'disabled':''} onclick="decide()">核验门槛并签发决定（生成决策证明）</button>`;
+    <button class="ok" ${disabled?'disabled':''} onclick="decide()">核验门槛并签发决定（生成决策证明）</button>
+    <button class="ghost" ${disabled?'disabled':''} onclick="saveDraft()">💾 存为断网草稿（本地签名，恢复后提交）</button>`;
   if(!g.ready) h+='<div class="mut small">五道安全门未全部通过，投票/签发已禁用。</div>';
   box.innerHTML=h;
 }
@@ -328,7 +413,10 @@ async function vote(expected){
     const sig=await api('POST','/api/sign',{member_id:member,snapshot_id:SID,content_hash:sp.content_hash,action});
     await act('投票',()=>api('POST',`/api/snapshots/${SID}/votes`,{member_id:member,action,signature:sig.signature,expected_version:expected}));
     setTimeout(refreshSnapDetail,250);
-  }catch(e){ toast('投票失败：'+e.message+(e.code==='snapshot_version_conflict'?'（并发冲突：请刷新快照后用新版本号重试）':''),true); await load(); setTimeout(refreshSnapDetail,250);}
+  }catch(e){
+    if(e.code==='offline'){ toast('当前断网：实时投票不可用，请改用「存为断网草稿」',true); return; }
+    toast('投票失败：'+e.message+(e.code==='snapshot_version_conflict'?'（并发冲突：请刷新快照后用新版本号重试）':''),true); await load(); setTimeout(refreshSnapDetail,250);
+  }
 }
 async function decide(){
   try{ const d=await api('POST',`/api/snapshots/${SID}/decisions`,{});
@@ -373,8 +461,97 @@ async function tamperProof(id){
     <pre>${esc(r.checks.map(c=>(c.passed?'✅':'❌')+' '+c.check).join('\n'))}</pre></div>`);
 }
 
+// ---------------- 断网草稿动作 ----------------
+async function saveDraft(){
+  const sp=window.__lastSnap;
+  if(!sp||sp.snapshot_id!==SID){ toast('快照详情未加载，无法存草稿',true); return; }
+  if(sp.superseded||sp.stale_by_new_material){ toast('快照已失效，不能存草稿',true); return; }
+  if(!sp.gates.ready){ toast('五道安全门未全过，草稿不会通过服务端核对',true); return; }
+  const member=document.getElementById('vm').value, action=document.getElementById('va').value;
+  const payload={snapshot_id:sp.snapshot_id,content_hash:sp.content_hash,action,member_id:member};
+  let sig;
+  try{ sig=await hmacHex('demo-key-'+member, canonicalJson(payload)); }
+  catch(e){ toast('本地签名失败（需 localhost/HTTPS 环境）：'+e.message,true); return; }
+  const drafts=loadDrafts();
+  const m=S.committee.find(x=>x.member_id===member);
+  drafts.push({draft_id:uid(),snapshot_id:sp.snapshot_id,cohort_id:sp.cohort_id,
+    member_id:member,member_name:m?m.name:member,action,content_hash:sp.content_hash,
+    signature:sig,expected_version:sp.vote_version,
+    created_at:new Date().toISOString(),status:'pending'});
+  saveDrafts(drafts);
+  toast('草稿已保存到本地（断网安全）：'+action+' @ '+sp.snapshot_id);
+  renderCenter();
+}
+async function submitDraft(id){
+  const drafts=loadDrafts(), d=drafts.find(x=>x.draft_id===id);
+  if(!d){ toast('草稿不在本地，以服务端队列为准'); await load(); return; }
+  if(d.status!=='pending'){ await replayDraft(id); return; }
+  if(OFFLINE){ toast('仍在断网：草稿保持「待提交」',true); return; }
+  // 1) 先核对快照仍然有效（迟到事件/替补/规则换版都会使草稿过期）
+  let sp=null;
+  try{ sp=await api('GET',`/api/snapshots/${d.snapshot_id}`); }
+  catch(e){ if(e.code==='offline'){ toast('网络未恢复，稍后再试',true); return; } }
+  if(sp){
+    const active=(S.rulesets.filter(r=>r.active)[0]||{}).version;
+    const bad=[];
+    if(sp.content_hash!==d.content_hash) bad.push('快照指纹不一致');
+    if(sp.superseded||sp.stale_by_new_material) bad.push('快照已被迟到事件/替补推进');
+    if(active&&sp.ruleset_version!==active) bad.push(`规则已换版 v${sp.ruleset_version}→v${active}`);
+    if(bad.length) toast('核对未通过：'+bad.join('；')+' → 提交服务端登记为「过期」',true);
+    d.expected_version=sp.vote_version;
+  }
+  // 2) 一次性提交：服务端权威核对 + 幂等（同一 draft_id 只产生一次结果）
+  try{
+    const r=await api('POST','/api/drafts',{draft_id:d.draft_id,snapshot_id:d.snapshot_id,
+      member_id:d.member_id,action:d.action,content_hash:d.content_hash,
+      signature:d.signature,expected_version:d.expected_version});
+    Object.assign(d,{status:r.draft.status,vote_id:r.draft.vote_id});
+    toast(r.replayed?'幂等回放：该草稿此前已提交，未产生第二张票':'草稿已提交：产生 1 张票 '+r.draft.vote_id);
+  }catch(e){
+    const dr=e.body&&e.body.draft;
+    if(dr&&dr.status==='expired'){
+      Object.assign(d,{status:'expired',conflict:dr.conflict});
+      toast('草稿已过期并阻止写入：'+(dr.conflict?dr.conflict.message:e.message),true);
+    }else if(e.code==='snapshot_version_conflict'||e.code==='hold_active'){
+      toast('暂缓：'+e.message+'（草稿保持待提交，可重试）',true);
+    }else if(e.code==='offline'){ toast('网络未恢复',true); return; }
+    else toast('提交失败：'+e.message,true);
+  }
+  saveDrafts(drafts); await load();
+}
+async function submitAllDrafts(){
+  for(const d of loadDrafts().filter(x=>x.status==='pending'&&x.cohort_id===CID))
+    await submitDraft(d.draft_id);
+}
+async function replayDraft(id){
+  const d=mergedDrafts().find(x=>x.draft_id===id); if(!d) return;
+  const local=loadDrafts().find(x=>x.draft_id===id);
+  const sig=(local&&local.signature)||d.signature;
+  if(OFFLINE||!sig){
+    toast('首次结果：'+(d.status==='submitted'?('已提交，票 '+d.vote_id)
+      :('过期 ['+(d.conflict&&d.conflict.code)+'] '+(d.conflict&&d.conflict.message))),d.status!=='submitted');
+    return;
+  }
+  // 重复提交同一 draft_id：服务端幂等回放首次结果，绝不产生第二张票
+  try{
+    const r=await api('POST','/api/drafts',{draft_id:d.draft_id,snapshot_id:d.snapshot_id,
+      member_id:d.member_id,action:d.action,content_hash:d.content_hash,
+      signature:sig,expected_version:d.expected_version||0});
+    toast('首次结果回放：已提交，票 '+r.draft.vote_id+'（未产生第二张票）');
+  }catch(e){
+    const dr=e.body&&e.body.draft;
+    if(dr) toast('首次结果回放：过期 ['+dr.conflict.code+'] '+dr.conflict.message,true);
+    else toast('回放失败：'+e.message,true);
+  }
+  await load();
+}
+function dropDraft(id){
+  saveDrafts(loadDrafts().filter(x=>!(x.draft_id===id&&x.status==='pending')));
+  renderCenter();
+}
+
 load();
-setInterval(()=>{ if(SID&&document.getElementById('snapDetail')&&!DID) refreshSnapDetail(); }, 8000);
+setInterval(()=>{ if(!OFFLINE&&SID&&document.getElementById('snapDetail')&&!DID) refreshSnapDetail(); }, 8000);
 </script>
 </body>
 </html>

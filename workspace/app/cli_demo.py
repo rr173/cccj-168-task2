@@ -175,6 +175,63 @@ def main():
         print(f"  {'✓' if c['passed'] else '✗'} {c['check']} {c.get('detail','')}")
     print(f"\n  总结论：verified = {v['verified']}")
 
+    line("13. 断网投票草稿：离线签名 → 恢复后先核对快照 → 幂等提交 / 过期阻断")
+    # 派生的子队列草案走一遍到「五门全过」的快照
+    cid2 = d["child_cohort_id"]
+    sids2 = [svc.enroll_subject("crc", cid2)["subject_id"] for _ in range(3)]
+    svc.freeze_cohort("pi", cid2)
+    for s in sids2:
+        svc.record_administration("nurse", cid2, s,
+                                  given_at="2026-10-23T10:00:00+00:00")
+    svc.advance_clock("2026-11-14T10:01:00+00:00")
+    sp2 = svc.create_snapshot("system", cid2)
+    print(f"  新队列 {cid2} 快照 {sp2['snapshot_id']} 五门全过，"
+          f"引擎={sp2['outcome']['recommendation']}")
+
+    # 委员 CM-DAC「断网」：本地把动作+快照指纹签成草稿（等价于工作台离线保存）
+    draft = {"draft_id": "DR-OFFLINE-1", "snapshot_id": sp2["snapshot_id"],
+             "member_id": "CM-DAC", "action": "escalate",
+             "content_hash": sp2["content_hash"],
+             "signature": sign(svc.conn, "CM-DAC", sp2["snapshot_id"],
+                               sp2["content_hash"], "escalate"),
+             "expected_version": 0}
+    print(f"  断网期间本地保存草稿 {draft['draft_id']}（escalate @ {sp2['snapshot_id']}）")
+
+    # 网络恢复前，迟到 AE 推进了快照 → 草稿过期，提交被阻止写入
+    svc.report_ae("crc", cid2, sids2[1], "迟报：输注反应", "grade3",
+                  "2026-11-10T00:00:00+00:00")
+    r = svc.submit_vote_draft("cm", **draft)
+    print(f"  恢复后提交：status={r['status']} 冲突=[{r['conflict']['code']}] "
+          f"{r['conflict']['message']}")
+    print(f"  ✓ 过期草稿未写入任何票（votes={svc.get_snapshot(sp2['snapshot_id'])['vote_version']}）")
+
+    # 裁定迟到事件（v2 规则下 grade3 不达 DLT 门槛）→ 重建快照 → 新草稿提交成功
+    late2 = svc.get_cohort(cid2)["adverse_events"][-1]
+    svc.adjudicate_ae("cm", late2["id"], True, False, "按 v2 规则 grade3 不计 DLT")
+    sp3 = svc.create_snapshot("system", cid2)
+    print(f"  重建快照 {sp3['snapshot_id']}：引擎={sp3['outcome']['recommendation']} "
+          f"DLT={sp3['outcome']['dlt_count']}（v2 规则）")
+    draft2 = {"draft_id": "DR-OFFLINE-2", "snapshot_id": sp3["snapshot_id"],
+              "member_id": "CM-DAC", "action": "escalate",
+              "content_hash": sp3["content_hash"],
+              "signature": sign(svc.conn, "CM-DAC", sp3["snapshot_id"],
+                                sp3["content_hash"], "escalate"),
+              "expected_version": 0}
+    r1 = svc.submit_vote_draft("cm", **draft2)
+    r2 = svc.submit_vote_draft("cm", **draft2)
+    print(f"  首次提交 status={r1['status']} vote={r1['vote_id']}；"
+          f"重复提交 replayed={r2.get('replayed')} 同一票={r2['vote_id'] == r1['vote_id']}")
+
+    # 第二名委员实时投票 → 签发 → 证明校验（实时链路不受草稿影响）
+    svc.cast_vote("cm", sp3["snapshot_id"], "CM-ELN", "escalate",
+                  sign(svc.conn, "CM-ELN", sp3["snapshot_id"],
+                       sp3["content_hash"], "escalate"), 1)
+    d2 = svc.issue_decision("dsmb", sp3["snapshot_id"])
+    v2 = svc.verify_proof(d2["decision_id"])
+    print(f"  决定 {d2['decision_id']}: {d2['action']}；证明校验 verified={v2['verified']}")
+    q = svc.list_vote_drafts(cid2)
+    print("  草稿队列：", ", ".join(f"{x['draft_id']}={x['status']}" for x in q))
+
 
 if __name__ == "__main__":
     main()
